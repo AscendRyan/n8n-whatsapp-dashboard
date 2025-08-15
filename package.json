@@ -1,0 +1,7 @@
+{
+  "name": "n8n-whatsapp-dashboard",
+  "private": true,
+  "type": "commonjs",
+  "scripts": { "start": "node n8n-whatsapp-dashboard.js" },
+  "dependencies": { "express": "^4.19.2", "cors": "^2.8.5" }
+}
