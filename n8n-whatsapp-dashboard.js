@@ -5,6 +5,7 @@
  * - Two configurable webhooks:
  *    1) MESSAGE_WEBHOOK_URL: POST { phone, message } when an agent clicks "Send"
  *    2) ACTION_WEBHOOK_URL:  POST { phone } when an agent clicks "Send Phone"
+ * - NEW: "Stop" button -> server posts { stop: "yes" } to MESSAGE_WEBHOOK_URL
  * - UI displays two copy-ready endpoints for your n8n HTTP Request nodes:
  *    - /webhook/incoming  (POST { phone, message })
  *    - /webhook/outgoing  (POST { phone, message })
@@ -198,6 +199,24 @@ app.post('/action', requireToken, async (req, res) => {
   }
 });
 
+// 3) NEW: "Stop" action -> forwards { stop: "yes" } to MESSAGE_WEBHOOK_URL
+app.post('/stop', requireToken, async (req, res) => {
+  try {
+    if (!MESSAGE_WEBHOOK_URL) {
+      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
+    }
+    const resp = await fetch(MESSAGE_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
+      body: JSON.stringify({ stop: 'yes' })
+    });
+    const text = await resp.text().catch(() => '');
+    res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String((err && err.message) || err) });
+  }
+});
+
 // --- UI (script avoids inner backticks; uses classic strings only) ---
 app.get('/', requireToken, (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -278,6 +297,7 @@ app.get('/', requireToken, (req, res) => {
       <input id="message" placeholder="Type a message…" />
       <button class="btn" id="send">Send</button>
       <button class="btn" id="sendPhone">Send Phone</button>
+      <button class="btn" id="stopBtn">Stop</button>
     </div>
   </div>
 
@@ -308,22 +328,21 @@ app.get('/', requireToken, (req, res) => {
     outgoingEpEl.value = defaultOutgoing;
 
     function fmtTs(ts){ var d = new Date(ts); return d.toLocaleString(); }
-    function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, function(m) {
+    function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, function(m) {
     return {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",   // <-- fixed here
-      "'": "&#39;"
-      }[m];
-      });
+    "&": "&amp;",
+    "<": "&lt;",
+    '"': "&quot;",
+    "'": "&#39;"
+    }[m];
+    });
     }
 
     function renderList(){
       var q = (searchEl.value||'').toLowerCase();
       var phones = Object.keys(chats).sort(function(a,b){
-        var aArr = chats[a]||[], bArr = chats[b]||=[];
+        var aArr = chats[a]||[], bArr = chats[b]||[];
         var at = aArr.length ? aArr[aArr.length-1].ts : 0;
         var bt = bArr.length ? bArr[bArr.length-1].ts : 0;
         return bt - at;
@@ -392,6 +411,14 @@ app.get('/', requireToken, (req, res) => {
         method:'POST', headers: headers, body: JSON.stringify({ phone: selected })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
         .then(function(d){ if (!d.ok) alert('Action failed: ' + (d.error||d.response||d.status)); });
+    };
+
+    // NEW: Stop button -> server proxies to MESSAGE_WEBHOOK_URL with { stop: "yes" }
+    document.getElementById('stopBtn').onclick = function(){
+      fetch('/stop' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
+        method:'POST'
+      }).then(function(r){ return r.json().catch(function(){ return {}; }); })
+        .then(function(d){ if (!d.ok) alert('Stop failed: ' + (d.error||d.response||d.status)); else alert('Stop sent.'); });
     };
 
     document.getElementById('eps').addEventListener('click', function(e){
