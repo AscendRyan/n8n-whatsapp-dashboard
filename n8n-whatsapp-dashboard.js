@@ -5,7 +5,7 @@
  * - Two configurable webhooks:
  *    1) MESSAGE_WEBHOOK_URL: POST { phone, message } when an agent clicks "Send"
  *    2) ACTION_WEBHOOK_URL:  POST { phone } when an agent clicks "Send Phone"
- * - "Stop" button -> POST { stop: "yes", phone } to MESSAGE_WEBHOOK_URL
+ * - NEW: "Send Stop" button -> POST { phone, stop: "yes" } to the 1st endpoint (Message Webhook)
  * - UI displays two copy-ready endpoints for your n8n HTTP Request nodes:
  *    - /webhook/incoming  (POST { phone, message })
  *    - /webhook/outgoing  (POST { phone, message })
@@ -28,8 +28,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || null;
-let MESSAGE_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';   // agent-typed message webhook
-let ACTION_WEBHOOK_URL  = process.env.ACTION_WEBHOOK_URL || ''; // phone-button webhook
+let MESSAGE_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';   // agent-typed message webhook (1st endpoint)
+let ACTION_WEBHOOK_URL  = process.env.ACTION_WEBHOOK_URL || ''; // phone-button webhook (2nd endpoint)
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
@@ -199,20 +199,16 @@ app.post('/action', requireToken, async (req, res) => {
   }
 });
 
-// 3) "Stop" action -> forwards { stop: "yes", phone } to MESSAGE_WEBHOOK_URL (or override via {url})
+// 3) NEW: Send stop -> forwards { phone, stop: "yes" } to MESSAGE_WEBHOOK_URL
 app.post('/stop', requireToken, async (req, res) => {
   try {
-    const body = req.body || {};
-    const overrideUrl = (body.url || '').trim(); // optional: let client pass a URL
-    const target = (overrideUrl || MESSAGE_WEBHOOK_URL || '').trim();
-    if (!target) {
-      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings or pass {url}.' });
+    const { phone, stop } = req.body || {};
+    if (!phone) return res.status(400).json({ ok: false, error: 'Expected JSON: { phone } (and optional { stop })' });
+    if (!MESSAGE_WEBHOOK_URL) {
+      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
     }
-
-    const payload = { stop: 'yes' };
-    if (body.phone) payload.phone = normalizePhone(body.phone);
-
-    const resp = await fetch(target, {
+    const payload = { phone: normalizePhone(phone), stop: String(stop || 'yes') };
+    const resp = await fetch(MESSAGE_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
       body: JSON.stringify(payload)
@@ -253,7 +249,7 @@ app.get('/', requireToken, (req, res) => {
     .in{ background:rgba(14,165,233,.15); align-self:flex-start; border:1px solid rgba(14,165,233,.3); }
     .out{ background:rgba(34,197,94,.15); align-self:flex-end; border:1px solid rgba(34,197,94,.3); }
     .user{ background:rgba(167,139,250,.15); align-self:flex-end; border:1px solid rgba(167,139,250,.3); }
-    .ts{ color:var(--muted); font-size:11px; margin-top:4px; }
+    .ts{ color:var(--muted); font-size:11px; }
     .composer{ display:flex; gap:8px; padding:12px; border-top:1px solid #1f2937; }
     .composer input{ flex:1; padding:10px; border-radius:8px; background:#0d1a2b; color:#e5e7eb; border:1px solid #1f2937; }
     .btn{ padding:10px 12px; border-radius:8px; background:#1f2937; color:#e5e7eb; border:1px solid #334155; cursor:pointer; }
@@ -304,7 +300,7 @@ app.get('/', requireToken, (req, res) => {
       <input id="message" placeholder="Type a message…" />
       <button class="btn" id="send">Send</button>
       <button class="btn" id="sendPhone">Send Phone</button>
-      <button class="btn" id="stopBtn">Stop</button>
+      <button class="btn" id="sendStop">Send Stop</button>
     </div>
   </div>
 
@@ -373,7 +369,7 @@ app.get('/', requireToken, (req, res) => {
       titleEl.textContent = selected ? selected : 'Select a chat';
       if (!selected) return;
       var arr = chats[selected] || [];
-      for (var i=0;i<arr.length;i++){
+      for (var i=0;i	arr.length;i++){
         var m = arr[i];
         var div = document.createElement('div');
         div.className = 'bubble ' + (m.direction||'in');
@@ -420,16 +416,13 @@ app.get('/', requireToken, (req, res) => {
         .then(function(d){ if (!d.ok) alert('Action failed: ' + (d.error||d.response||d.status)); });
     };
 
-    // Stop button -> server proxies to MESSAGE_WEBHOOK_URL with { stop: "yes", phone }
-    document.getElementById('stopBtn').onclick = function(){
+    // NEW: Send Stop button
+    document.getElementById('sendStop').onclick = function(){
       if (!selected) { alert('Pick a chat first'); return; }
-      var url = (hookMessageEl.value || '').trim(); // allow immediate override without saving
       fetch('/stop' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-        method:'POST',
-        headers: headers,
-        body: JSON.stringify({ phone: selected, url: url || undefined })
+        method:'POST', headers: headers, body: JSON.stringify({ phone: selected, stop: 'yes' })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
-        .then(function(d){ if (!d.ok) alert('Stop failed: ' + (d.error||d.response||d.status)); else alert('Stop sent.'); });
+        .then(function(d){ if (!d.ok) alert('Stop failed: ' + (d.error||d.response||d.status)); });
     };
 
     document.getElementById('eps').addEventListener('click', function(e){
