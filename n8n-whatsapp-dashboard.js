@@ -5,7 +5,7 @@
  * - Two configurable webhooks:
  *    1) MESSAGE_WEBHOOK_URL: POST { phone, message } when an agent clicks "Send"
  *    2) ACTION_WEBHOOK_URL:  POST { phone } when an agent clicks "Send Phone"
- * - NEW: "Send Stop" button -> POST { phone, stop: "yes" } to the 1st endpoint (Message Webhook)
+ * - "Send Stop" button -> POST { phone, stop: "yes" } to the 1st endpoint (Message Webhook)
  * - UI displays two copy-ready endpoints for your n8n HTTP Request nodes:
  *    - /webhook/incoming  (POST { phone, message })
  *    - /webhook/outgoing  (POST { phone, message })
@@ -199,15 +199,24 @@ app.post('/action', requireToken, async (req, res) => {
   }
 });
 
-// 3) NEW: Send stop -> forwards { phone, stop: "yes" } to MESSAGE_WEBHOOK_URL
+// 3) Send stop -> forwards { phone, stop: "yes" } to MESSAGE_WEBHOOK_URL
 app.post('/stop', requireToken, async (req, res) => {
   try {
-    const { phone, stop } = req.body || {};
-    if (!phone) return res.status(400).json({ ok: false, error: 'Expected JSON: { phone } (and optional { stop })' });
+    const body = req.body || {};
+    // Be forgiving about field name
+    const rawPhone = body.phone || body.to || body.from || body.contact || body.number;
+    if (!rawPhone || !String(rawPhone).trim()) {
+      return res.status(400).json({ ok: false, error: 'Expected JSON: { phone } (and optional { stop })' });
+    }
+    const payload = { phone: normalizePhone(rawPhone), stop: String(body.stop || 'yes') };
+
     if (!MESSAGE_WEBHOOK_URL) {
       return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
     }
-    const payload = { phone: normalizePhone(phone), stop: String(stop || 'yes') };
+
+    // Helpful debug log (remove later if you want less noise)
+    console.log('STOP payload → Message Webhook:', payload);
+
     const resp = await fetch(MESSAGE_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
@@ -218,6 +227,12 @@ app.post('/stop', requireToken, async (req, res) => {
   } catch (err) {
     res.status(500).json({ ok: false, error: String((err && err.message) || err) });
   }
+});
+
+// Optional: debug echo
+app.post('/debug/echo', requireToken, (req, res) => {
+  console.log('DEBUG ECHO BODY:', req.body);
+  res.json({ ok: true, body: req.body });
 });
 
 // --- UI (script avoids inner backticks; uses classic strings only) ---
@@ -369,7 +384,7 @@ app.get('/', requireToken, (req, res) => {
       titleEl.textContent = selected ? selected : 'Select a chat';
       if (!selected) return;
       var arr = chats[selected] || [];
-      for (var i=0;i	arr.length;i++){
+      for (var i=0; i < arr.length; i++){
         var m = arr[i];
         var div = document.createElement('div');
         div.className = 'bubble ' + (m.direction||'in');
@@ -419,8 +434,12 @@ app.get('/', requireToken, (req, res) => {
     // NEW: Send Stop button
     document.getElementById('sendStop').onclick = function(){
       if (!selected) { alert('Pick a chat first'); return; }
+      // quick console log for debugging the selected phone
+      try { console.log('Sending STOP for phone:', selected); } catch(_){}
       fetch('/stop' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-        method:'POST', headers: headers, body: JSON.stringify({ phone: selected, stop: 'yes' })
+        method:'POST',
+        headers: headers,
+        body: JSON.stringify({ phone: selected, stop: 'yes' })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
         .then(function(d){ if (!d.ok) alert('Stop failed: ' + (d.error||d.response||d.status)); });
     };
