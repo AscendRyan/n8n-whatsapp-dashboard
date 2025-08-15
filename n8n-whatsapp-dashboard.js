@@ -5,7 +5,7 @@
  * - Two configurable webhooks:
  *    1) MESSAGE_WEBHOOK_URL: POST { phone, message } when an agent clicks "Send"
  *    2) ACTION_WEBHOOK_URL:  POST { phone } when an agent clicks "Send Phone"
- * - NEW: "Stop" button -> server posts { stop: "yes" } to MESSAGE_WEBHOOK_URL
+ * - "Stop" button -> POST { stop: "yes", phone } to MESSAGE_WEBHOOK_URL
  * - UI displays two copy-ready endpoints for your n8n HTTP Request nodes:
  *    - /webhook/incoming  (POST { phone, message })
  *    - /webhook/outgoing  (POST { phone, message })
@@ -199,16 +199,23 @@ app.post('/action', requireToken, async (req, res) => {
   }
 });
 
-// 3) NEW: "Stop" action -> forwards { stop: "yes" } to MESSAGE_WEBHOOK_URL
+// 3) "Stop" action -> forwards { stop: "yes", phone } to MESSAGE_WEBHOOK_URL (or override via {url})
 app.post('/stop', requireToken, async (req, res) => {
   try {
-    if (!MESSAGE_WEBHOOK_URL) {
-      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
+    const body = req.body || {};
+    const overrideUrl = (body.url || '').trim(); // optional: let client pass a URL
+    const target = (overrideUrl || MESSAGE_WEBHOOK_URL || '').trim();
+    if (!target) {
+      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings or pass {url}.' });
     }
-    const resp = await fetch(MESSAGE_WEBHOOK_URL, {
+
+    const payload = { stop: 'yes' };
+    if (body.phone) payload.phone = normalizePhone(body.phone);
+
+    const resp = await fetch(target, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
-      body: JSON.stringify({ stop: 'yes' })
+      body: JSON.stringify(payload)
     });
     const text = await resp.text().catch(() => '');
     res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
@@ -413,10 +420,14 @@ app.get('/', requireToken, (req, res) => {
         .then(function(d){ if (!d.ok) alert('Action failed: ' + (d.error||d.response||d.status)); });
     };
 
-    // NEW: Stop button -> server proxies to MESSAGE_WEBHOOK_URL with { stop: "yes" }
+    // Stop button -> server proxies to MESSAGE_WEBHOOK_URL with { stop: "yes", phone }
     document.getElementById('stopBtn').onclick = function(){
+      if (!selected) { alert('Pick a chat first'); return; }
+      var url = (hookMessageEl.value || '').trim(); // allow immediate override without saving
       fetch('/stop' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-        method:'POST'
+        method:'POST',
+        headers: headers,
+        body: JSON.stringify({ phone: selected, url: url || undefined })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
         .then(function(d){ if (!d.ok) alert('Stop failed: ' + (d.error||d.response||d.status)); else alert('Stop sent.'); });
     };
