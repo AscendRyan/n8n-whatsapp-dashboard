@@ -1,16 +1,23 @@
 /**
  * n8n WhatsApp Conversations Dashboard (single-file server + UI)
  * --------------------------------------------------------------
- * - Incoming & outgoing webhooks from n8n show in a live dashboard (grouped by phone)
- * - Agents can type and send -> forwards { phone, message } to a configurable "Message Webhook"
- * - NEW: "Send Phone" button -> forwards { phone } to a configurable "Phone Button Webhook"
- * - UI shows the two endpoints you should POST to from n8n (Incoming & Outgoing)
+ * - Live dashboard grouped by phone number
+ * - Two configurable webhooks:
+ *    1) MESSAGE_WEBHOOK_URL: POST { phone, message } when an agent clicks "Send"
+ *    2) ACTION_WEBHOOK_URL:  POST { phone } when an agent clicks "Send Phone"
+ * - UI displays two copy-ready endpoints for your n8n HTTP Request nodes:
+ *    - /webhook/incoming  (POST { phone, message })
+ *    - /webhook/outgoing  (POST { phone, message })
  *
  * Env vars (optional)
  *  - PORT
- *  - DASHBOARD_TOKEN           // if set, require ?token=... or header X-Auth-Token
- *  - SEND_WEBHOOK_URL          // prefill "Message Webhook" (legacy name, kept for compatibility)
- *  - ACTION_WEBHOOK_URL        // prefill "Phone Button Webhook"
+ *  - DASHBOARD_TOKEN          // if set, require ?token=... or header X-Auth-Token
+ *  - SEND_WEBHOOK_URL         // prefill Message Webhook (kept for compatibility)
+ *  - ACTION_WEBHOOK_URL       // prefill Phone Button Webhook
+ *
+ * Run locally:
+ *   npm i express cors
+ *   node n8n-whatsapp-dashboard.js
  */
 
 const express = require('express');
@@ -20,21 +27,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || null;
-let MESSAGE_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';     // message webhook (agent typed)
-let ACTION_WEBHOOK_URL  = process.env.ACTION_WEBHOOK_URL || '';   // phone-button webhook
+let MESSAGE_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';   // agent-typed message webhook
+let ACTION_WEBHOOK_URL  = process.env.ACTION_WEBHOOK_URL || ''; // phone-button webhook
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
-// --- Tiny auth ---
+// --- Auth middleware (simple shared token) ---
 function requireToken(req, res, next) {
-  if (!DASHBOARD_TOKEN) return next();
+  if (!DASHBOARD_TOKEN) return next(); // open mode
   const supplied = req.get('X-Auth-Token') || req.query.token;
   if (supplied === DASHBOARD_TOKEN) return next();
   res.status(401).send('Unauthorized');
 }
 
-// --- In-memory chats ---
+// --- In-memory chat store ---
 const chats = new Map(); // Map<phone, Array<{ body, direction: 'in'|'out'|'user', ts }>>
 
 function normalizePhone(raw) {
@@ -51,7 +58,7 @@ function addMessage(phoneRaw, body, direction) {
   return { phone, msg };
 }
 
-// --- SSE (live updates) ---
+// --- SSE for live updates ---
 const sseClients = new Set();
 function broadcast(event, data) {
   const payload = 'event: ' + event + '\n' + 'data: ' + JSON.stringify(data) + '\n\n';
@@ -73,10 +80,10 @@ app.get('/events', requireToken, (req, res) => {
   req.on('close', () => sseClients.delete(res));
 });
 
-// --- Helper to build absolute endpoint URLs (incl. token query if present) ---
+// Build absolute endpoint URLs (and include token in QS if present on this request)
 function buildSettingsPayload(req) {
   const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0] || req.protocol || 'https';
-  const host  = req.headers['x-forwarded-host'] || req.headers['host'] || 'localhost:' + PORT;
+  const host  = req.headers['x-forwarded-host'] || req.headers['host'] || ('localhost:' + PORT);
   const base  = proto + '://' + host;
 
   const tokenFromQS = req.query && req.query.token ? String(req.query.token) : '';
@@ -110,7 +117,7 @@ app.post('/webhook/outgoing', requireToken, (req, res) => {
   res.json({ ok: true, phone: p });
 });
 
-// Optional generic:
+// Optional single generic endpoint
 app.post('/webhook/message', requireToken, (req, res) => {
   const { phone, message, direction } = req.body || {};
   if (!phone || typeof message === 'undefined' || !['in','out'].includes(direction)) {
@@ -131,12 +138,12 @@ app.post('/settings/webhooks', requireToken, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Provide both { messageWebhookUrl, actionWebhookUrl } as strings.' });
   }
   MESSAGE_WEBHOOK_URL = messageWebhookUrl.trim();
-  ACTION_WEBHOOK_URL = actionWebhookUrl.trim();
+  ACTION_WEBHOOK_URL  = actionWebhookUrl.trim();
   broadcast('settings', { messageWebhookUrl: MESSAGE_WEBHOOK_URL, actionWebhookUrl: ACTION_WEBHOOK_URL });
   res.json({ ok: true, messageWebhookUrl: MESSAGE_WEBHOOK_URL, actionWebhookUrl: ACTION_WEBHOOK_URL });
 });
 
-// Back-compat: allow the legacy single setter
+// Back-compat: legacy single setter (sets message webhook)
 app.post('/settings/webhook', requireToken, (req, res) => {
   const { url } = req.body || {};
   if (!url || typeof url !== 'string') {
@@ -148,7 +155,7 @@ app.post('/settings/webhook', requireToken, (req, res) => {
 });
 
 // --- Agent actions ---
-// 1) Send a message (uses Message Webhook)
+// 1) Send a message -> forwards { phone, message } to MESSAGE_WEBHOOK_URL
 app.post('/send', requireToken, async (req, res) => {
   try {
     const { phone, message } = req.body || {};
@@ -158,9 +165,7 @@ app.post('/send', requireToken, async (req, res) => {
     if (!MESSAGE_WEBHOOK_URL) {
       return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
     }
-    // Echo immediately
     const { phone: p } = addMessage(phone, message, 'user');
-
     const resp = await fetch(MESSAGE_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
@@ -169,11 +174,11 @@ app.post('/send', requireToken, async (req, res) => {
     const text = await resp.text().catch(() => '');
     res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+    res.status(500).json({ ok: false, error: String((err && err.message) || err) });
   }
 });
 
-// 2) Send the phone only (uses Phone Button Webhook)
+// 2) Send the phone only -> forwards { phone } to ACTION_WEBHOOK_URL
 app.post('/action', requireToken, async (req, res) => {
   try {
     const { phone } = req.body || {};
@@ -189,11 +194,11 @@ app.post('/action', requireToken, async (req, res) => {
     const text = await resp.text().catch(() => '');
     res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+    res.status(500).json({ ok: false, error: String((err && err.message) || err) });
   }
 });
 
-// --- Minimal UI (script uses ONLY classic strings; no inner backticks) ---
+// --- UI (script avoids inner backticks; uses classic strings only) ---
 app.get('/', requireToken, (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(`<!doctype html>
@@ -277,7 +282,7 @@ app.get('/', requireToken, (req, res) => {
   </div>
 
   <script>
-    // no backticks in this script (so server template parsing is safe)
+    // (No backticks here — safe to embed inside server template literal)
     var qs = new URLSearchParams(window.location.search);
     var token = qs.get('token') || '';
     var headers = token ? { 'X-Auth-Token': token, 'Content-Type':'application/json' } : { 'Content-Type': 'application/json' };
@@ -294,6 +299,13 @@ app.get('/', requireToken, (req, res) => {
     var hookActionEl  = document.getElementById('hookAction');
     var incomingEpEl  = document.getElementById('incomingEp');
     var outgoingEpEl  = document.getElementById('outgoingEp');
+
+    // Show defaults immediately (so boxes are never empty)
+    var origin = window.location.origin;
+    var defaultIncoming = origin + '/webhook/incoming' + (token ? ('?token=' + encodeURIComponent(token)) : '');
+    var defaultOutgoing = origin + '/webhook/outgoing' + (token ? ('?token=' + encodeURIComponent(token)) : '');
+    incomingEpEl.placeholder = defaultIncoming;
+    outgoingEpEl.placeholder = defaultOutgoing;
 
     function fmtTs(ts){ var d = new Date(ts); return d.toLocaleString(); }
     function escapeHtml(s){
@@ -385,14 +397,18 @@ app.get('/', requireToken, (req, res) => {
       setTimeout(function(){ b.textContent = 'Copy'; }, 800);
     });
 
-    searchEl.addEventListener('input', renderList);
-
+    // Fill settings/endpoints from server when available
     function applySettings(payload){
       if (!payload) return;
       if (typeof payload.messageWebhookUrl === 'string') hookMessageEl.value = payload.messageWebhookUrl;
-      if (typeof payload.actionWebhookUrl === 'string')  hookActionEl.value = payload.actionWebhookUrl;
+      if (typeof payload.actionWebhookUrl === 'string')  hookActionEl.value  = payload.actionWebhookUrl;
+
+      // Use server-provided endpoints if present, else keep current, else fall back to defaults
       if (typeof payload.incomingEndpoint === 'string')  incomingEpEl.value = payload.incomingEndpoint;
+      if (!incomingEpEl.value) incomingEpEl.value = defaultIncoming;
+
       if (typeof payload.outgoingEndpoint === 'string')  outgoingEpEl.value = payload.outgoingEndpoint;
+      if (!outgoingEpEl.value) outgoingEpEl.value = defaultOutgoing;
     }
 
     // Open SSE
@@ -400,8 +416,7 @@ app.get('/', requireToken, (req, res) => {
     es.addEventListener('init', function(ev){
       try {
         var data = JSON.parse(ev.data);
-        var c = data.chats || {};
-        chats = c;
+        chats = data.chats || {};
         applySettings(data);
         renderList(); renderChat();
       } catch(e){}
@@ -420,7 +435,7 @@ app.get('/', requireToken, (req, res) => {
       try { applySettings(JSON.parse(ev.data)); } catch(e){}
     });
 
-    // Initial fetch of settings (absolute URLs)
+    // Initial GET /settings (builds absolute URLs from the server side)
     fetch('/settings' + (token ? ('?token=' + encodeURIComponent(token)) : ''), { headers: token ? { 'X-Auth-Token': token } : {} })
       .then(function(r){ return r.json().catch(function(){ return {}; }); })
       .then(function(d){ applySettings(d); });
