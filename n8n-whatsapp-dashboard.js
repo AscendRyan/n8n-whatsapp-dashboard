@@ -1,14 +1,16 @@
 /**
  * n8n WhatsApp Conversations Dashboard (single-file server + UI)
  * --------------------------------------------------------------
- * - Accepts POST webhooks from n8n for incoming & outgoing WhatsApp messages
- * - Groups chats by phone and shows them live
- * - Agents can send replies; server forwards { phone, message } JSON to a configurable webhook
- * - Real-time updates via SSE (Server-Sent Events)
+ * - Incoming & outgoing webhooks from n8n show in a live dashboard (grouped by phone)
+ * - Agents can type and send -> forwards { phone, message } to a configurable "Message Webhook"
+ * - NEW: "Send Phone" button -> forwards { phone } to a configurable "Phone Button Webhook"
+ * - UI shows the two endpoints you should POST to from n8n (Incoming & Outgoing)
  *
- * Run locally:
- *   npm i express cors
- *   node n8n-whatsapp-dashboard.js
+ * Env vars (optional)
+ *  - PORT
+ *  - DASHBOARD_TOKEN           // if set, require ?token=... or header X-Auth-Token
+ *  - SEND_WEBHOOK_URL          // prefill "Message Webhook" (legacy name, kept for compatibility)
+ *  - ACTION_WEBHOOK_URL        // prefill "Phone Button Webhook"
  */
 
 const express = require('express');
@@ -17,23 +19,23 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Simple token auth (optional)
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || null;
-let SEND_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';
+let MESSAGE_WEBHOOK_URL = process.env.SEND_WEBHOOK_URL || '';     // message webhook (agent typed)
+let ACTION_WEBHOOK_URL  = process.env.ACTION_WEBHOOK_URL || '';   // phone-button webhook
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 
-// --- Tiny auth middleware ---
+// --- Tiny auth ---
 function requireToken(req, res, next) {
-  if (!DASHBOARD_TOKEN) return next(); // open mode
+  if (!DASHBOARD_TOKEN) return next();
   const supplied = req.get('X-Auth-Token') || req.query.token;
   if (supplied === DASHBOARD_TOKEN) return next();
   res.status(401).send('Unauthorized');
 }
 
-// --- In-memory chat store ---
-const chats = new Map(); // Map<phone, Array<{body, direction: 'in'|'out'|'user', ts}>>
+// --- In-memory chats ---
+const chats = new Map(); // Map<phone, Array<{ body, direction: 'in'|'out'|'user', ts }>>
 
 function normalizePhone(raw) {
   if (!raw) return '';
@@ -49,14 +51,11 @@ function addMessage(phoneRaw, body, direction) {
   return { phone, msg };
 }
 
-// --- SSE for live updates ---
+// --- SSE (live updates) ---
 const sseClients = new Set();
-
 function broadcast(event, data) {
   const payload = 'event: ' + event + '\n' + 'data: ' + JSON.stringify(data) + '\n\n';
-  for (const res of sseClients) {
-    try { res.write(payload); } catch (_) {}
-  }
+  for (const res of sseClients) { try { res.write(payload); } catch (_) {} }
 }
 
 app.get('/events', requireToken, (req, res) => {
@@ -64,17 +63,35 @@ app.get('/events', requireToken, (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
-
   sseClients.add(res);
 
-  // Initial snapshot
+  // Initial snapshot + settings
   const snapshot = Object.fromEntries(chats.entries());
-  res.write('event: init\n' + 'data: ' + JSON.stringify({ chats: snapshot, sendWebhookUrl: SEND_WEBHOOK_URL }) + '\n\n');
+  const settings = buildSettingsPayload(req);
+  res.write('event: init\n' + 'data: ' + JSON.stringify({ chats: snapshot, ...settings }) + '\n\n');
 
   req.on('close', () => sseClients.delete(res));
 });
 
-// --- Webhooks from n8n ---
+// --- Helper to build absolute endpoint URLs (incl. token query if present) ---
+function buildSettingsPayload(req) {
+  const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0] || req.protocol || 'https';
+  const host  = req.headers['x-forwarded-host'] || req.headers['host'] || 'localhost:' + PORT;
+  const base  = proto + '://' + host;
+
+  const tokenFromQS = req.query && req.query.token ? String(req.query.token) : '';
+  const tokenQS = (DASHBOARD_TOKEN && tokenFromQS) ? ('?token=' + encodeURIComponent(tokenFromQS)) : '';
+
+  return {
+    messageWebhookUrl: MESSAGE_WEBHOOK_URL,
+    actionWebhookUrl: ACTION_WEBHOOK_URL,
+    incomingEndpoint: base + '/webhook/incoming' + (tokenQS || ''),
+    outgoingEndpoint: base + '/webhook/outgoing' + (tokenQS || ''),
+    tokenRequired: !!DASHBOARD_TOKEN
+  };
+}
+
+// --- Webhooks from n8n (to display in dashboard) ---
 app.post('/webhook/incoming', requireToken, (req, res) => {
   const { phone, message } = req.body || {};
   if (!phone || typeof message === 'undefined') {
@@ -93,7 +110,7 @@ app.post('/webhook/outgoing', requireToken, (req, res) => {
   res.json({ ok: true, phone: p });
 });
 
-// Single generic endpoint (optional)
+// Optional generic:
 app.post('/webhook/message', requireToken, (req, res) => {
   const { phone, message, direction } = req.body || {};
   if (!phone || typeof message === 'undefined' || !['in','out'].includes(direction)) {
@@ -103,50 +120,80 @@ app.post('/webhook/message', requireToken, (req, res) => {
   res.json({ ok: true, phone: p });
 });
 
-// --- Settings (target webhook for agent sends) ---
+// --- Settings (get/set both webhooks) ---
 app.get('/settings', requireToken, (req, res) => {
-  res.json({ sendWebhookUrl: SEND_WEBHOOK_URL });
+  res.json(buildSettingsPayload(req));
 });
 
+app.post('/settings/webhooks', requireToken, (req, res) => {
+  const { messageWebhookUrl, actionWebhookUrl } = req.body || {};
+  if (typeof messageWebhookUrl !== 'string' || typeof actionWebhookUrl !== 'string') {
+    return res.status(400).json({ ok: false, error: 'Provide both { messageWebhookUrl, actionWebhookUrl } as strings.' });
+  }
+  MESSAGE_WEBHOOK_URL = messageWebhookUrl.trim();
+  ACTION_WEBHOOK_URL = actionWebhookUrl.trim();
+  broadcast('settings', { messageWebhookUrl: MESSAGE_WEBHOOK_URL, actionWebhookUrl: ACTION_WEBHOOK_URL });
+  res.json({ ok: true, messageWebhookUrl: MESSAGE_WEBHOOK_URL, actionWebhookUrl: ACTION_WEBHOOK_URL });
+});
+
+// Back-compat: allow the legacy single setter
 app.post('/settings/webhook', requireToken, (req, res) => {
   const { url } = req.body || {};
   if (!url || typeof url !== 'string') {
     return res.status(400).json({ ok: false, error: 'Provide { url } as a string.' });
   }
-  SEND_WEBHOOK_URL = url.trim();
-  broadcast('settings', { sendWebhookUrl: SEND_WEBHOOK_URL });
-  res.json({ ok: true, sendWebhookUrl: SEND_WEBHOOK_URL });
+  MESSAGE_WEBHOOK_URL = url.trim();
+  broadcast('settings', { messageWebhookUrl: MESSAGE_WEBHOOK_URL });
+  res.json({ ok: true, messageWebhookUrl: MESSAGE_WEBHOOK_URL });
 });
 
-// --- Agent sends from dashboard ---
+// --- Agent actions ---
+// 1) Send a message (uses Message Webhook)
 app.post('/send', requireToken, async (req, res) => {
   try {
     const { phone, message } = req.body || {};
     if (!phone || typeof message === 'undefined') {
       return res.status(400).json({ ok: false, error: 'Expected JSON: { phone, message }' });
     }
-    if (!SEND_WEBHOOK_URL) {
-      return res.status(400).json({ ok: false, error: 'No SEND_WEBHOOK_URL configured. Set it in Settings or env var.' });
+    if (!MESSAGE_WEBHOOK_URL) {
+      return res.status(400).json({ ok: false, error: 'No Message Webhook configured. Set it in Settings.' });
     }
-
-    // Echo immediately in UI
+    // Echo immediately
     const { phone: p } = addMessage(phone, message, 'user');
 
-    // Forward to external webhook (n8n)
-    const resp = await fetch(SEND_WEBHOOK_URL, {
+    const resp = await fetch(MESSAGE_WEBHOOK_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
       body: JSON.stringify({ phone: p, message })
     });
-
     const text = await resp.text().catch(() => '');
     res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String((err && err.message) || err) });
+    res.status(500).json({ ok: false, error: String(err && err.message || err) });
   }
 });
 
-// --- Minimal UI (no inner backticks in <script>) ---
+// 2) Send the phone only (uses Phone Button Webhook)
+app.post('/action', requireToken, async (req, res) => {
+  try {
+    const { phone } = req.body || {};
+    if (!phone) return res.status(400).json({ ok: false, error: 'Expected JSON: { phone }' });
+    if (!ACTION_WEBHOOK_URL) {
+      return res.status(400).json({ ok: false, error: 'No Phone Button Webhook configured. Set it in Settings.' });
+    }
+    const resp = await fetch(ACTION_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(DASHBOARD_TOKEN ? { 'X-From-Dashboard': 'true' } : {}) },
+      body: JSON.stringify({ phone: normalizePhone(phone) })
+    });
+    const text = await resp.text().catch(() => '');
+    res.json({ ok: resp.ok, status: resp.status, response: text.slice(0, 1000) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err && err.message || err) });
+  }
+});
+
+// --- Minimal UI (script uses ONLY classic strings; no inner backticks) ---
 app.get('/', requireToken, (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(`<!doctype html>
@@ -167,8 +214,9 @@ app.get('/', requireToken, (req, res) => {
     .item.active{ background:#0d1a2b; }
     .phone{ font-weight:600; }
     .preview{ color:var(--muted); font-size:13px; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+
     .main{ flex:1; display:flex; flex-direction:column; }
-    .topbar{ padding:12px; border-bottom:1px solid #1f2937; display:flex; justify-content:space-between; align-items:center; }
+    .topbar{ padding:12px; border-bottom:1px solid #1f2937; display:flex; justify-content:space-between; align-items:center; gap:12px; }
     .chat{ flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
     .bubble{ max-width:70%; padding:10px 12px; border-radius:12px; line-height:1.3; white-space:pre-wrap; word-wrap:break-word; }
     .in{ background:rgba(14,165,233,.15); align-self:flex-start; border:1px solid rgba(14,165,233,.3); }
@@ -179,9 +227,14 @@ app.get('/', requireToken, (req, res) => {
     .composer input{ flex:1; padding:10px; border-radius:8px; background:#0d1a2b; color:#e5e7eb; border:1px solid #1f2937; }
     .btn{ padding:10px 12px; border-radius:8px; background:#1f2937; color:#e5e7eb; border:1px solid #334155; cursor:pointer; }
     .btn:disabled{ opacity:.6; cursor:not-allowed; }
-    .settings{ padding:12px; display:flex; gap:8px; align-items:center; }
+    .settings{ display:flex; gap:8px; align-items:center; }
     .settings input{ flex:1; padding:8px; border-radius:8px; background:#0d1a2b; color:#e5e7eb; border:1px solid #1f2937; }
+    .settings-grid{ display:grid; grid-template-columns:1fr 1fr auto; gap:8px; width:min(1024px, 100%); }
     .token{ color:var(--muted); font-size:12px; }
+    .endpoints{ font-size:12px; color:#cbd5e1; display:grid; grid-template-columns:1fr auto; gap:6px; margin-top:8px; }
+    .endpoints input{ width:100%; padding:6px; background:#0d1a2b; border:1px solid #1f2937; border-radius:6px; color:#e5e7eb; }
+    .copy{ padding:6px 8px; }
+    .row{ display:flex; flex-direction:column; gap:8px; }
   </style>
 </head>
 <body>
@@ -191,55 +244,73 @@ app.get('/', requireToken, (req, res) => {
     </header>
     <div id="list" class="list"></div>
   </div>
+
   <div class="main">
     <div class="topbar">
       <div>
         <div id="title" style="font-weight:700">Select a chat</div>
         <div class="token">${DASHBOARD_TOKEN ? 'Token-protected' : 'Open access'}</div>
       </div>
-      <div class="settings">
-        <input id="hook" placeholder="Send Webhook URL (n8n webhook)" />
-        <button class="btn" id="saveHook">Save</button>
+
+      <div class="row" style="flex:1">
+        <div class="settings-grid">
+          <input id="hookMessage" placeholder="Message Webhook URL (receives {phone, message})" />
+          <input id="hookAction"  placeholder="Phone Button Webhook URL (receives {phone})" />
+          <button class="btn" id="saveHooks">Save</button>
+        </div>
+        <div class="endpoints" id="eps">
+          <input id="incomingEp" readonly title="Incoming endpoint (POST { phone, message })" />
+          <button class="btn copy" data-copy="incomingEp">Copy</button>
+          <input id="outgoingEp" readonly title="Outgoing endpoint (POST { phone, message })" />
+          <button class="btn copy" data-copy="outgoingEp">Copy</button>
+        </div>
       </div>
     </div>
+
     <div id="chat" class="chat"></div>
+
     <div class="composer">
       <input id="message" placeholder="Type a message…" />
       <button class="btn" id="send">Send</button>
+      <button class="btn" id="sendPhone">Send Phone</button>
     </div>
   </div>
 
   <script>
-    // No backticks anywhere in this script on purpose
+    // no backticks in this script (so server template parsing is safe)
     var qs = new URLSearchParams(window.location.search);
     var token = qs.get('token') || '';
     var headers = token ? { 'X-Auth-Token': token, 'Content-Type':'application/json' } : { 'Content-Type': 'application/json' };
 
-    var chats = {};  // { phone: [ { body, direction, ts }, ... ] }
+    var chats = {};   // { phone: [ { body, direction, ts }, ... ] }
     var selected = null;
-    var sendWebhookUrl = '';
 
     var listEl = document.getElementById('list');
     var chatEl = document.getElementById('chat');
     var titleEl = document.getElementById('title');
-    var hookEl = document.getElementById('hook');
     var searchEl = document.getElementById('search');
 
-    function fmtTs(ts) {
-      var d = new Date(ts);
-      return d.toLocaleString();
+    var hookMessageEl = document.getElementById('hookMessage');
+    var hookActionEl  = document.getElementById('hookAction');
+    var incomingEpEl  = document.getElementById('incomingEp');
+    var outgoingEpEl  = document.getElementById('outgoingEp');
+
+    function fmtTs(ts){ var d = new Date(ts); return d.toLocaleString(); }
+    function escapeHtml(s){
+      return String(s).replace(/[&<>\"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\'':'&#39;'}[m]); });
     }
 
-    function renderList() {
-      var q = (searchEl.value || '').toLowerCase();
+    function renderList(){
+      var q = (searchEl.value||'').toLowerCase();
       var phones = Object.keys(chats).sort(function(a,b){
-        var at = (chats[a] && chats[a].length) ? chats[a][chats[a].length-1].ts : 0;
-        var bt = (chats[b] && chats[b].length) ? chats[b][chats[b].length-1].ts : 0;
+        var aArr = chats[a]||[], bArr = chats[b]||[];
+        var at = aArr.length ? aArr[aArr.length-1].ts : 0;
+        var bt = bArr.length ? bArr[bArr.length-1].ts : 0;
         return bt - at;
       }).filter(function(p){ return p.toLowerCase().includes(q); });
 
       var html = phones.map(function(p){
-        var arr = chats[p] || [];
+        var arr = chats[p]||[];
         var last = arr.length ? arr[arr.length-1] : null;
         var preview = last ? String(last.body).replace(/\\n/g,' ') : '';
         var active = (p === selected) ? 'item active' : 'item';
@@ -251,103 +322,108 @@ app.get('/', requireToken, (req, res) => {
       listEl.innerHTML = html;
     }
 
-    function renderChat() {
+    function renderChat(){
       chatEl.innerHTML = '';
       titleEl.textContent = selected ? selected : 'Select a chat';
       if (!selected) return;
       var arr = chats[selected] || [];
-      for (var i=0;i<arr.length;i++) {
+      for (var i=0;i<arr.length;i++){
         var m = arr[i];
         var div = document.createElement('div');
-        div.className = 'bubble ' + (m.direction || 'in');
+        div.className = 'bubble ' + (m.direction||'in');
         div.innerHTML = escapeHtml(m.body) + '<div class="ts">' + fmtTs(m.ts) + '</div>';
         chatEl.appendChild(div);
       }
       chatEl.scrollTop = chatEl.scrollHeight;
     }
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>\"']/g, function(m){
-        return ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\'':'&#39;'}[m]);
-      });
-    }
-
     listEl.addEventListener('click', function(e){
       var item = e.target.closest('.item');
       if (!item) return;
       selected = item.getAttribute('data-phone');
-      renderList();
-      renderChat();
+      renderList(); renderChat();
     });
 
-    document.getElementById('saveHook').onclick = function() {
-      var url = (hookEl.value || '').trim();
-      if (!url) { alert('Please enter a URL'); return; }
-      fetch('/settings/webhook' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({ url: url })
+    document.getElementById('saveHooks').onclick = function(){
+      var msgUrl = (hookMessageEl.value||'').trim();
+      var actUrl = (hookActionEl.value||'').trim();
+      if (!msgUrl || !actUrl) { alert('Please fill both webhook URLs.'); return; }
+      fetch('/settings/webhooks' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
+        method:'POST', headers: headers, body: JSON.stringify({ messageWebhookUrl: msgUrl, actionWebhookUrl: actUrl })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
-        .then(function(d){ if (d.ok) alert('Saved'); else alert('Error: ' + (d.error || 'Unknown')); });
+        .then(function(d){ if (d.ok) alert('Saved'); else alert('Error: ' + (d.error||'Unknown')); });
     };
 
-    document.getElementById('send').onclick = function() {
+    document.getElementById('send').onclick = function(){
       if (!selected) { alert('Pick a chat first'); return; }
       var input = document.getElementById('message');
-      var message = (input.value || '').trim();
+      var message = (input.value||'').trim();
       if (!message) return;
       input.value = '';
       fetch('/send' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
-        method: 'POST',
-        headers: headers,
-        body: JSON.stringify({ phone: selected, message: message })
+        method:'POST', headers: headers, body: JSON.stringify({ phone: selected, message: message })
       }).then(function(r){ return r.json().catch(function(){ return {}; }); })
-        .then(function(d){ if (!d.ok) alert('Send failed: ' + (d.error || d.response || d.status)); });
+        .then(function(d){ if (!d.ok) alert('Send failed: ' + (d.error||d.response||d.status)); });
     };
+
+    document.getElementById('sendPhone').onclick = function(){
+      if (!selected) { alert('Pick a chat first'); return; }
+      fetch('/action' + (token ? ('?token=' + encodeURIComponent(token)) : ''), {
+        method:'POST', headers: headers, body: JSON.stringify({ phone: selected })
+      }).then(function(r){ return r.json().catch(function(){ return {}; }); })
+        .then(function(d){ if (!d.ok) alert('Action failed: ' + (d.error||d.response||d.status)); });
+    };
+
+    document.getElementById('eps').addEventListener('click', function(e){
+      var b = e.target.closest('button[data-copy]');
+      if (!b) return;
+      var id = b.getAttribute('data-copy');
+      var inp = document.getElementById(id);
+      inp.select(); inp.setSelectionRange(0, 99999);
+      try { document.execCommand('copy'); } catch(_){}
+      b.textContent = 'Copied';
+      setTimeout(function(){ b.textContent = 'Copy'; }, 800);
+    });
 
     searchEl.addEventListener('input', renderList);
 
-    function refreshSettings(){
-      fetch('/settings' + (token ? ('?token=' + encodeURIComponent(token)) : ''), { headers: token ? { 'X-Auth-Token': token } : {} })
-        .then(function(r){ return r.json().catch(function(){ return {}; }); })
-        .then(function(d){ sendWebhookUrl = d.sendWebhookUrl || ''; hookEl.value = sendWebhookUrl; });
+    function applySettings(payload){
+      if (!payload) return;
+      if (typeof payload.messageWebhookUrl === 'string') hookMessageEl.value = payload.messageWebhookUrl;
+      if (typeof payload.actionWebhookUrl === 'string')  hookActionEl.value = payload.actionWebhookUrl;
+      if (typeof payload.incomingEndpoint === 'string')  incomingEpEl.value = payload.incomingEndpoint;
+      if (typeof payload.outgoingEndpoint === 'string')  outgoingEpEl.value = payload.outgoingEndpoint;
     }
 
     // Open SSE
     var es = new EventSource('/events' + (token ? ('?token=' + encodeURIComponent(token)) : ''));
     es.addEventListener('init', function(ev){
       try {
-        var payload = JSON.parse(ev.data);
-        chats = payload.chats || {};
-        sendWebhookUrl = payload.sendWebhookUrl || '';
-        hookEl.value = sendWebhookUrl;
-        renderList();
-        renderChat();
-      } catch (e) {}
+        var data = JSON.parse(ev.data);
+        var c = data.chats || {};
+        chats = c;
+        applySettings(data);
+        renderList(); renderChat();
+      } catch(e){}
     });
     es.addEventListener('message', function(ev){
       try {
         var obj = JSON.parse(ev.data);
-        var phone = obj.phone;
-        var body = obj.body;
-        var direction = obj.direction;
-        var ts = obj.ts;
+        var phone = obj.phone, body = obj.body, direction = obj.direction, ts = obj.ts;
         if (!chats[phone]) chats[phone] = [];
         chats[phone].push({ body: body, direction: direction, ts: ts });
         if (!selected) selected = phone;
-        renderList();
-        if (selected === phone) renderChat();
-      } catch (e) {}
+        renderList(); if (selected === phone) renderChat();
+      } catch(e){}
     });
     es.addEventListener('settings', function(ev){
-      try {
-        var obj = JSON.parse(ev.data);
-        sendWebhookUrl = obj.sendWebhookUrl || '';
-        hookEl.value = sendWebhookUrl;
-      } catch (e) {}
+      try { applySettings(JSON.parse(ev.data)); } catch(e){}
     });
 
-    refreshSettings();
+    // Initial fetch of settings (absolute URLs)
+    fetch('/settings' + (token ? ('?token=' + encodeURIComponent(token)) : ''), { headers: token ? { 'X-Auth-Token': token } : {} })
+      .then(function(r){ return r.json().catch(function(){ return {}; }); })
+      .then(function(d){ applySettings(d); });
   </script>
 </body>
 </html>`);
