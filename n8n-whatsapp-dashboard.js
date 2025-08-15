@@ -308,9 +308,15 @@ app.get('/', requireToken, (req, res) => {
     outgoingEpEl.value = defaultOutgoing;
 
     function fmtTs(ts){ var d = new Date(ts); return d.toLocaleString(); }
-    function escapeHtml(s){
-      return String(s).replace(/[&<>"']/g, function(m){
-        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m];
+    function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function(m) {
+    return {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",   // <-- fixed here
+      "'": "&#39;"
+      }[m];
       });
     }
 
