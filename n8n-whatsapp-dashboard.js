@@ -304,18 +304,20 @@ app.get('/', requireToken, (req, res) => {
     var origin = window.location.origin;
     var defaultIncoming = origin + '/webhook/incoming' + (token ? ('?token=' + encodeURIComponent(token)) : '');
     var defaultOutgoing = origin + '/webhook/outgoing' + (token ? ('?token=' + encodeURIComponent(token)) : '');
-    incomingEpEl.placeholder = defaultIncoming;
-    outgoingEpEl.placeholder = defaultOutgoing;
+    incomingEpEl.value = defaultIncoming;
+    outgoingEpEl.value = defaultOutgoing;
 
     function fmtTs(ts){ var d = new Date(ts); return d.toLocaleString(); }
     function escapeHtml(s){
-      return String(s).replace(/[&<>\"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;','\'':'&#39;'}[m]); });
+      return String(s).replace(/[&<>\"']/g, function(m){
+        return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m];
+      });
     }
 
     function renderList(){
       var q = (searchEl.value||'').toLowerCase();
       var phones = Object.keys(chats).sort(function(a,b){
-        var aArr = chats[a]||[], bArr = chats[b]||[];
+        var aArr = chats[a]||[], bArr = chats[b]||=[];
         var at = aArr.length ? aArr[aArr.length-1].ts : 0;
         var bt = bArr.length ? bArr[bArr.length-1].ts : 0;
         return bt - at;
@@ -403,12 +405,9 @@ app.get('/', requireToken, (req, res) => {
       if (typeof payload.messageWebhookUrl === 'string') hookMessageEl.value = payload.messageWebhookUrl;
       if (typeof payload.actionWebhookUrl === 'string')  hookActionEl.value  = payload.actionWebhookUrl;
 
-      // Use server-provided endpoints if present, else keep current, else fall back to defaults
+      // Use server-provided endpoints if present; defaults already filled
       if (typeof payload.incomingEndpoint === 'string')  incomingEpEl.value = payload.incomingEndpoint;
-      if (!incomingEpEl.value) incomingEpEl.value = defaultIncoming;
-
       if (typeof payload.outgoingEndpoint === 'string')  outgoingEpEl.value = payload.outgoingEndpoint;
-      if (!outgoingEpEl.value) outgoingEpEl.value = defaultOutgoing;
     }
 
     // Open SSE
